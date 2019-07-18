@@ -1,0 +1,156 @@
+---
+title: "Nonparametric Adjustment Strategies for Causal Inference"
+author: "Miles D. Williams"
+date: "University of Illinois, Urbana-Champaign"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document outlines a general adjustment strategy for causal inference. It is applicable in settings where one wishes to estimate the average treatment effect of some intervention, but random assignment is in doubt. That is, one suspects propensity to receive treatment to be dependent on observable (and unobservable) characteristics of individual observations. Such is often the case in observational settings where treatment was not randomly assigned by a researcher or in field experiments where infelicities in design put random assignment in doubt.
+
+Various strategies for dealing with this problem exist. Matching and its many permutations immediately comes to mind. I propose another strategy that takes its cue from the principles of regression based adjustment. The basic premise of multiple regression is that the researcher partials out variation in the treatment and outcome variables as explained by a set of confounding variables. 
+
+Though useful, this approach imposes the assumption that covariates are linearly associated with both the treatment and the outcome. If the functional form by which these variables confound causal estimates is nonlinear, this raises concerns about whether the ATE obtained via adjustment with multiple regression is reliable.
+
+A simple workaround for this problem is to partial out the confounding influence of a set of covariates via a procedure that imposes minimal assumptions about functional form. 
+
+Consider how the partial effect of a variable is determined through multiple regression. Say we have the following linear model:
+$$Y_i = \beta_0 + \beta_1x_{i1} + \beta_2x_{i2} + \beta_3x_{i3} + \epsilon_i: \epsilon \sim N(0,\sigma).$$
+For variable $x_{i1}$, the coefficient $\beta_1$ captures the linear association between $x_{i1}$ and $Y_i$, subtracting out the linear association of $x_{i2}$ and $x_{i3}$ with $x_{i1}$ and $Y_i$. This is equivalent to:
+$$
+\begin{aligned}
+\varepsilon_i^Y & = \alpha + \beta_1\varepsilon_i^{x_{1}} + \upsilon_i, \\
+\text{s.t.} & \\
+\varepsilon_i^Y & = Y_i - \hat{Y}_i: \hat{Y}_i = \gamma_0 + \gamma_1x_{i2} + \gamma_3x_{i3}, \\
+\varepsilon_i^{x_1} & = x_{i1} - \hat{x}_{i1}: \hat{x}_{i1} = \delta_0 + \delta_1x_{i2} + \delta_3x_{i3}.
+\end{aligned}
+$$
+In words, $\beta_1$ denotes the simple linear association between the residual variance in $Y_i$ not explained as a linear function of $x_{i2}$ and $x_{i3}$ and the residual variance in $x_{i1}$ not explained as a linear function of $x_{i2}$ and $x_{i3}$.
+
+This logic is straightforward, but one can imagine problems creeping in if either the outcome or the explanatory variable of interest, or *both*, are not linearly explained by the remaining covariates. Once more, the difficulty of determining whether this assumption is met for so many covariates grows exponentially with the number of variables included in model estimation.
+
+While the principle idea that multiple regression is, in a certain sense, regression of residuals on residuals is useful, the linear and additive assumptions this approach imposes can be undesirable and, indeed, hard to confirm. I propose we work around this problem by keeping the principle of residual regression, but tossing linear regression as the approach to residualizing outcome and treatment. That is, let's obtain an estimate for $\beta_1$ via a more flexible adjustment strategy. Instead of estimate $\beta_1$ as shown above, estimate $\beta_1$ as follows:
+$$
+\begin{aligned}
+\varepsilon_i^Y & = \alpha + \beta_1\varepsilon_i^{x_{1}} + \upsilon_i, \\
+\text{s.t.} & \\
+\varepsilon_i^Y & = Y_i - \hat{Y}_i: \hat{Y}_i = f(x_{i2},x_{i3}), \\
+\varepsilon_i^{x_1} & = x_{i1} - \hat{x}_{i1}: \hat{x}_{i1} = g(x_{i2},x_{i3}),
+\end{aligned}
+$$
+where $f(\cdot)$ and $g(\cdot)$ predict $Y_i$ and $x_{i1}$ as a function of confounders, but where we make no a priori assumptions about the form these functions take. Of course, I refer to application of nonparametric approaches. Some useful options include decision tree methods like random forest (RF) and semiparametric techniques like support vector machines (SVM) and kernel regression. By applying these approaches we relieve ourselves (though not totally) of the need to think about how confounders relate to the outcome and to treatment assignment. Our focus, now, lies squarely on estimating the average treatment effect. Or else, in an observational setting where a researcher wishes to test some associational hypothesis, the researcher may use this technique to partial out the influence of confounders and focus exclusively on the relationship being tested.
+
+```{r}
+# The nonparametric adjustment estimator
+nae = function(y, z, x, data=NULL, method = "RF"){ # Choice of RF, SVM, or NP
+  require(randomForest)
+  require(e1071)
+  require(np)
+  require(tidyverse)
+  require(lmtest)
+  require(sandwich)
+  attach(data)
+  data = data %>%
+    mutate(y = y,
+           z = z)
+  
+  if(method=="RF"){
+    # Residualize outcome
+    y_hat = suppressWarnings(predict(randomForest(update(x, y ~ .), data = data)))
+    y_res = data$y - y_hat
+  
+    # Residualize treatment
+    z_hat = suppressWarnings(predict(randomForest(update(x, z ~ .), data = data)))
+    z_res = data$z - z_hat
+  } else if(method=="SVM"){
+    # Residualize outcome
+    y_hat = suppressWarnings(predict(svm(update(x, y ~ .), data = data)))
+    y_res = data$y - y_hat
+  
+    # Residualize treatment
+    z_hat = suppressWarnings(predict(svm(update(x, z ~ .), data = data)))
+    z_res = data$z - z_hat
+  } else {
+    # Residualize outcome
+    y_hat = suppressWarnings(predict(npreg(update(x, y ~ .), data = data)))
+    y_res = data$y - y_hat
+  
+    # Residualize treatment
+    z_hat = suppressWarnings(predict(npreg(update(x, z ~ .), data = data)))
+    z_res = data$z - z_hat
+  }
+  detach(data)
+  
+  # Regress outcome on treatment
+  fit = lm(y_res ~ z_res)
+  
+  # Estimate HC2 SEs and return ATE with summary stats
+  results = 
+    tibble(
+      " " = c("ATE","S.E.","t-value","p-value"),
+      Results = coeftest(fit,vcovHC(fit, type = "HC2"))[2,]
+    )
+  fitted = data$y - fit$residuals
+  r.squared = cor(fitted,data$y)^2
+  improved.r.squared = r.squared - cor(y_hat,data$y)^2
+  output = list(
+    results=results, 
+    fit = fitted, 
+    r.squared = r.squared, 
+    change.r.squared = improved.r.squared,
+    residual.vars = tibble(Outcome = y_res, Treatment = z_res)
+  )
+  return(output)
+}
+
+# write function to plot the ATE
+plot_ATE = function(model,points=T){
+  require(tidyverse)
+  if(points == T){
+    model$residual.vars %>%
+      ggplot(aes(Treatment,Outcome)) + 
+      geom_point() + 
+      geom_smooth(method = "lm", color="black") +
+      labs(title = "ATE with 95% CIs") + 
+      theme(plot.title = element_text(hjust = 0.5))
+  } else {
+    model$residual.vars %>%
+      ggplot(aes(Treatment,Outcome)) +
+      geom_smooth(method = "lm", color = "black") + 
+      labs(title = "ATE with 95% CIs") + 
+      theme(plot.title = element_text(hjust = 0.5))
+  }
+}
+```
+
+```{r}
+# Test
+library(Matching)
+data(GerberGreenImai)
+
+results_RF = nae(y = VOTED98, 
+                z = PHN.C1,
+                x = ~ AGE + VOTE96.1 + PERSONS + NEW + MAJORPTY + WARD, 
+                data = GerberGreenImai)
+```
+
+```{r}
+results_RF$results
+```
+
+```{r}
+library(extrafont)
+loadfonts(quiet = T)
+plot_ATE(results_RF,points=F) +
+  theme_minimal() + 
+  theme(text = element_text(family = "Palatino Linotype"),
+        plot.title = element_text(hjust = .5))
+```
+
+```{r}
+save(nae,plot_ATE,file = "nae_routine.Rdata")
+```
+
